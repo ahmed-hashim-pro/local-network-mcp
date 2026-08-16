@@ -33,7 +33,7 @@ It turns "can you check why the Raspberry Pi dropped off the network" into a wor
 
 1. Clone and install dependencies:
 ```bash
-git clone https://github.com/YOUR_USERNAME/local-network-mcp.git
+git clone https://github.com/ahmed-hashim-pro/local-network-mcp.git
 cd local-network-mcp
 pip3 install -r requirements.txt
 ```
