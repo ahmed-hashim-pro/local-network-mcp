@@ -1,0 +1,5 @@
+# mcp 2.x removed the low-level Server.list_tools()/call_tool() decorators
+# this server is built on, so pin to the 1.x line.
+mcp<2
+paramiko
+psutil

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "local-network": {
+      "command": "python3",
+      "args": ["/path/to/local-network-mcp/network_mcp_server.py"]
+    }
+  }
+}

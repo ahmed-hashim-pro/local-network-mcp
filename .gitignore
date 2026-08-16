@@ -1,0 +1,28 @@
+# IDE / tooling
+.idea/
+.qodo/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+
+# Env & secrets
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.ppk
+known_hosts
+
+# OS
+.DS_Store
