@@ -4,6 +4,12 @@ A Model Context Protocol (MCP) server that allows Claude to interact with your l
 
 It turns "can you check why the Raspberry Pi dropped off the network" into a workflow the agent executes itself: `scan_network` → `ping_host` → `ssh_connect` → `ssh_execute` → diagnosis. Persistent SSH sessions mean the agent connects once and runs multi-step remote workflows (inspect logs, restart a service, verify) in a single conversation.
 
+## Demo
+
+![Demo](docs/demo.gif)
+
+*Claude discovering a device on the local network, opening an SSH session, and diagnosing it end to end.*
+
 ## Features
 
 ### Local System Tools
@@ -434,3 +440,16 @@ The server maintains persistent SSH connections for better performance:
 - File search with recursive option can be slow on large directories
 - SSH connections are persistent and reused for better performance
 - Command timeouts prevent hanging on stuck commands
+
+## Roadmap
+
+- Command allowlist/denylist mode for `execute_local_command`
+- Strict host-key verification option to replace the `AutoAddPolicy` default
+- Structured JSON tool outputs alongside the current text responses
+- Configurable scan ranges and rate limiting for `scan_network`
+- Per-tool timeout and output-size caps
+- Port the low-level server to the `mcp` 2.x API (currently pinned to `mcp<2`)
+
+## License
+
+MIT — see [LICENSE](LICENSE).
