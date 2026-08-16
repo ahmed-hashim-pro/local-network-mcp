@@ -8,7 +8,9 @@ It turns "can you check why the Raspberry Pi dropped off the network" into a wor
 
 ![Demo](docs/demo.gif)
 
-*Claude discovering a device on the local network, opening an SSH session, and diagnosing it end to end.*
+*Illustrative walkthrough — Claude discovers a device on the local network, opens a persistent
+SSH session, and diagnoses the fault end to end. Reconstructed for the README; not a recording
+of a live run.*
 
 ## Features
 
