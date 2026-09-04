@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-network-mcp"
+version = "1.1.0"
+description = "An MCP server for local network discovery, system inspection and SSH, with destructive tools off by default."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Ahmed Hashim" }]
+keywords = ["mcp", "model-context-protocol", "claude", "ssh", "network", "llm-agents"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Networking",
+]
+
+# mcp 2.x removed the low-level Server.list_tools()/call_tool() decorators this
+# server is built on, so the major version here is a compatibility boundary,
+# not just a pin.
+dependencies = [
+    "mcp==1.29.1",
+    "paramiko==5.0.0",
+    "psutil==7.2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.16.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/ahmed-hashim-pro/local-network-mcp"
+Repository = "https://github.com/ahmed-hashim-pro/local-network-mcp"
+
+[project.scripts]
+local-network-mcp = "network_mcp_server:run"
+
+[tool.setuptools]
+py-modules = ["network_mcp_server"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4"]

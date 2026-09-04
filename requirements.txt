@@ -1,5 +1,6 @@
-# mcp 2.x removed the low-level Server.list_tools()/call_tool() decorators
-# this server is built on, so pin to the 1.x line.
-mcp<2
-paramiko
-psutil
+# Kept for `pip install -r requirements.txt`; pyproject.toml is the source of truth.
+# mcp 2.x removed the low-level Server.list_tools()/call_tool() decorators this
+# server is built on, so the major version is a compatibility boundary.
+mcp==1.29.1
+paramiko==5.0.0
+psutil==7.2.2

@@ -26,3 +26,9 @@ known_hosts
 
 # OS
 .DS_Store
+
+# Build & test artefacts
+.pytest_cache/
+.ruff_cache/
+build/
+dist/

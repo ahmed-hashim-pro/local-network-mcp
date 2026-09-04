@@ -1,37 +1,21 @@
-#!/bin/bash
-
-# Installation script for Local Network MCP Server
-
-echo "Installing dependencies for Local Network MCP Server..."
-echo "=================================================="
+#!/usr/bin/env bash
+# Creates a virtualenv and installs the server into it.
+set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# Check if pip is available
-if ! command -v pip3 &> /dev/null; then
-    echo "Error: pip3 not found. Please install Python 3 with pip."
-    exit 1
-fi
+python3 -m venv .venv
+./.venv/bin/pip install --upgrade pip
+./.venv/bin/pip install -e .
 
-# Install requirements
-echo "Installing Python packages..."
-pip3 install -r requirements.txt
+cat <<EOF
 
-# Check if installation was successful
-if [ $? -eq 0 ]; then
-    echo ""
-    echo "✅ Installation successful!"
-    echo ""
-    echo "Testing the server..."
-    timeout 3 python3 network_mcp_server.py &
-    sleep 2
-    echo ""
-    echo "If no errors appeared above, the server is ready!"
-    echo ""
-    echo "Next steps:"
-    echo "1. Restart Claude Desktop completely (quit and reopen)"
-    echo "2. Ask Claude to scan your network"
-else
-    echo ""
-    echo "❌ Installation failed. Please check the error messages above."
-fi
+Installed. Point your MCP client at:
+
+  command: $(pwd)/.venv/bin/python
+  args:    ["$(pwd)/network_mcp_server.py"]
+
+The three state-changing tools (execute_local_command, ssh_execute,
+kill_process) are denied by default. See the Security model section of
+README.md to opt in to the ones you want.
+EOF

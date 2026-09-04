@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      # No credentials, no network and no reachable hosts are needed: the suite
+      # asserts the tool policy, never that a shell command ran.
+      - name: Test
+        run: pytest
+
+      # The runner has none of the opt-in variables set, so this is also a check
+      # that a clean environment really does start in the denied state.
+      - name: Destructive tools are denied on a clean machine
+        run: |
+          python - <<'PY'
+          import network_mcp_server as server
+          for tool, env_var in server.DESTRUCTIVE_TOOLS.items():
+              assert not server.is_tool_enabled(tool), f"{tool} was enabled by default!"
+              print(f"{tool}: denied (opt in with {env_var}=1)")
+          PY
