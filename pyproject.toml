@@ -21,9 +21,9 @@ classifiers = [
     "Topic :: System :: Networking",
 ]
 
-# mcp 2.x removed the low-level Server.list_tools()/call_tool() decorators this
-# server is built on, so the major version here is a compatibility boundary,
-# not just a pin.
+# Exact pins. The mcp major version is also a compatibility boundary: 2.x
+# removed the low-level Server.list_tools()/call_tool() decorators this server
+# is built on, so moving off 1.x is a rewrite, not an upgrade.
 dependencies = [
     "mcp==1.29.1",
     "paramiko==5.0.0",
