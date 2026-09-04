@@ -1,5 +1,7 @@
 # Local Network MCP Server
 
+[![CI](https://github.com/ahmed-hashim-pro/local-network-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/ahmed-hashim-pro/local-network-mcp/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A Model Context Protocol (MCP) server that allows Claude to interact with your local network, execute local shell commands, monitor system resources, and manage remote devices via SSH.
 
 It turns "can you check why the Raspberry Pi dropped off the network" into a workflow the agent executes itself: `scan_network` → `ping_host` → `ssh_connect` → `ssh_execute` → diagnosis. Persistent SSH sessions mean the agent connects once and runs multi-step remote workflows (inspect logs, restart a service, verify) in a single conversation.
@@ -11,6 +13,79 @@ It turns "can you check why the Raspberry Pi dropped off the network" into a wor
 *Illustrative walkthrough — Claude discovers a device on the local network, opens a persistent
 SSH session, and diagnoses the fault end to end. Reconstructed for the README; not a recording
 of a live run.*
+
+## Security model
+
+An LLM decides when these tools run, which makes "the operator will be careful"
+useless as a control. So the three tools that can change or destroy state are
+**off unless you turn them on**:
+
+| Tool | Can do | Default | Opt in with |
+| --- | --- | --- | --- |
+| `execute_local_command` | run any local shell command | **denied** | `LNMCP_ENABLE_EXEC=1` |
+| `ssh_execute` | run any command on a remote host | **denied** | `LNMCP_ENABLE_SSH_EXEC=1` |
+| `kill_process` | terminate a process by PID | **denied** | `LNMCP_ENABLE_KILL=1` |
+
+Everything else — discovery, ping, port checks, system stats, process *listing*,
+directory *listing*, file search — is read-only and always available. Out of the
+box this server is a diagnostic instrument that cannot change anything.
+
+Disabled tools are also advertised as disabled in the tool listing, so the agent
+knows not to spend a turn on them. A refusal names the variable that would allow
+the call:
+
+```json
+{
+  "success": false,
+  "policy": "default-deny",
+  "tool": "execute_local_command",
+  "error": "execute_local_command is disabled because it can change or destroy state. Set LNMCP_ENABLE_EXEC=1 in the server's environment (the \"env\" block of your MCP client config) and restart the server to enable it."
+}
+```
+
+Two properties make this a boundary rather than a suggestion:
+
+- **The switch is not reachable from a tool argument.** It lives in the server's
+  environment, which you set in the client config. `execute_local_command` does
+  take an `env` parameter, but that is applied to the child process — passing
+  `env={"LNMCP_ENABLE_EXEC": "1"}` enables nothing. The agent cannot turn its own
+  guardrails off, and there is a test for exactly that.
+- **The gate sits at each tool's own entry point**, not at the dispatch layer, so
+  an internal caller cannot route around it — `ssh_execute` stays refused even
+  though it is reachable via `ssh_connect`.
+
+### What this does not do
+
+The limits matter more than the feature list:
+
+- Once enabled, `execute_local_command` runs **arbitrary** shell commands with the
+  permissions of the server process. There is no allowlist and no sandbox. The
+  opt-in is a deliberate per-tool decision, nothing more.
+- SSH uses `AutoAddPolicy`, so an unknown host key is accepted on first contact.
+  Convenient on a LAN you own; wrong on a network you do not.
+- Tool calls are not audit-logged.
+
+Run it against machines you own.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    C[Claude] <-->|MCP / JSON-RPC over stdio| S[network_mcp_server.py]
+    S --> G{policy gate}
+    G -->|read-only, always on| RO["scan_network, ping_host, check_port<br/>get_system_info, list_processes<br/>find_files, get_directory_listing"]
+    G -->|state-changing, opt-in| RW["execute_local_command<br/>ssh_execute, kill_process"]
+    RW -. denied unless LNMCP_ENABLE_* .-> C
+    RO --> N[(local network / this host)]
+    RW --> N
+    S -.->|persistent sessions| POOL[(SSH connection pool)]
+```
+
+A single stdio server. `list_tools` advertises the catalogue and stamps disabled
+tools; `call_tool` dispatches by name. Each state-changing function re-checks the
+policy itself before doing any work. SSH connections are pooled by
+`user@host:port` so a multi-step remote workflow authenticates once.
+
 
 ## Features
 
@@ -39,21 +114,33 @@ of a live run.*
 
 ## Installation
 
-1. Clone and install dependencies:
+Python 3.11+.
+
 ```bash
 git clone https://github.com/ahmed-hashim-pro/local-network-mcp.git
 cd local-network-mcp
-pip3 install -r requirements.txt
+
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -e .
 ```
 
-Or run the install script:
+A virtualenv is not optional on most systems: a Homebrew or system Python will
+refuse a bare `pip install` with `error: externally-managed-environment` (PEP 668).
+
+Verify the install — this prints the policy state and exits, unlike starting the
+server, which waits on stdin for an MCP client and will look like it has hung:
+
 ```bash
-./install.sh
+python -c "import network_mcp_server as s; print({t: s.is_tool_enabled(t) for t in s.DESTRUCTIVE_TOOLS})"
+# {'execute_local_command': False, 'ssh_execute': False, 'kill_process': False}
 ```
 
-2. Test the server (optional):
+Run the tests (no credentials, no network, no reachable hosts required):
+
 ```bash
-python3 network_mcp_server.py
+pip install -e ".[dev]"
+pytest
 ```
 
 ## Configuration
@@ -68,8 +155,26 @@ Add this server to your Claude Desktop configuration:
 {
   "mcpServers": {
     "local-network": {
-      "command": "python3",
+      "command": "/path/to/local-network-mcp/.venv/bin/python",
       "args": ["/path/to/local-network-mcp/network_mcp_server.py"]
+    }
+  }
+}
+```
+
+That configuration is read-only: the agent can discover and diagnose, but not
+change anything. To enable a state-changing tool, add it to an `env` block — and
+add only the ones you actually want:
+
+```json
+{
+  "mcpServers": {
+    "local-network": {
+      "command": "/path/to/local-network-mcp/.venv/bin/python",
+      "args": ["/path/to/local-network-mcp/network_mcp_server.py"],
+      "env": {
+        "LNMCP_ENABLE_SSH_EXEC": "1"
+      }
     }
   }
 }
@@ -80,12 +185,16 @@ Add this server to your Claude Desktop configuration:
 Or register with Claude Code:
 
 ```bash
-claude mcp add local-network -- python3 /path/to/local-network-mcp/network_mcp_server.py
+claude mcp add local-network -- /path/to/local-network-mcp/.venv/bin/python \
+  /path/to/local-network-mcp/network_mcp_server.py
 ```
 
 After adding the configuration, restart Claude Desktop.
 
 ## Usage Examples
+
+> The first three groups below use tools that are **denied by default**.
+> See [Security model](#security-model) for the opt-in.
 
 ### Local Command Execution
 - "Execute 'ls -la' on my local machine"
@@ -140,6 +249,7 @@ After adding the configuration, restart Claude Desktop.
 ### Local System Tools
 
 #### `execute_local_command`
+**Denied by default** — opt in with `LNMCP_ENABLE_EXEC=1`.
 Execute shell commands on your local machine with full control.
 
 **Parameters:**
@@ -176,6 +286,7 @@ Show me the top 20 processes by CPU usage
 ```
 
 #### `kill_process`
+**Denied by default** — opt in with `LNMCP_ENABLE_KILL=1`.
 Terminate or force kill a process by PID.
 
 **Parameters:**
@@ -279,30 +390,20 @@ The server maintains persistent SSH connections for better performance:
 - Automatic connection recovery if a connection drops
 - Manual disconnect when done
 
-## Security Notes
+## Operational notes
 
-### Local Command Security
-- **IMPORTANT**: This server can execute ANY command on your local machine
-- Commands run with the same permissions as the Python process
-- Be extremely careful with destructive commands (rm, dd, etc.)
-- Always review commands before execution
-- Consider running the MCP server with limited permissions
-- Never execute untrusted commands
+The enforced policy is described under [Security model](#security-model) above.
+These are the operational caveats that sit alongside it:
 
-### Network Security
-- This server only works on your **local network**
-- Requires appropriate network permissions
-- Make sure you have permission to scan devices on your network
-- Network scanning may be detected by security tools
-
-### SSH Security
-- SSH credentials are handled securely in memory
-- Connections are encrypted using SSH protocol
-- Uses Paramiko library with industry-standard security
-- Consider using SSH keys instead of passwords for better security
-- The server accepts host keys automatically (AutoAddPolicy) - be cautious on untrusted networks
-
-**IMPORTANT**: Never share your SSH passwords or private keys. This tool should only be used on trusted networks and by trusted users.
+- Enabled commands run with the permissions of the server process. Run it as a
+  user with the least privilege that still does the job — not as root.
+- You need permission to scan the network you point it at, and scanning may trip
+  intrusion detection on a corporate LAN.
+- Prefer SSH keys over passwords. Credentials passed as tool arguments are held
+  in memory for the life of the pooled connection and are never written to disk,
+  but a key file that Paramiko reads is still the safer path.
+- `AutoAddPolicy` accepts unknown host keys on first contact, so first connection
+  on an untrusted network is trust-on-first-use with no verification.
 
 ## Common Local Commands
 
@@ -373,12 +474,12 @@ The server maintains persistent SSH connections for better performance:
 
 ## Requirements
 
-- Python 3.7+
-- mcp library
-- paramiko library (for SSH)
-- psutil library (for system monitoring)
-- Network access permissions
-- SSH access to target devices (for remote operations)
+- Python 3.11+
+- `mcp==1.29.1` — pinned to the 1.x line; 2.x removed the low-level
+  `Server.list_tools()` / `call_tool()` decorators this server is built on
+- `paramiko==5.0.0` (SSH), `psutil==7.2.2` (system monitoring)
+- Network access permission for the range you scan
+- SSH access to target devices, for the remote tools
 
 ## Example Workflows
 
@@ -445,12 +546,36 @@ The server maintains persistent SSH connections for better performance:
 
 ## Roadmap
 
-- Command allowlist/denylist mode for `execute_local_command`
+- Command allowlist/denylist mode for `execute_local_command`, narrowing the
+  current all-or-nothing opt-in
+- An audit log of every tool call, so an enabled server is reviewable
 - Strict host-key verification option to replace the `AutoAddPolicy` default
 - Structured JSON tool outputs alongside the current text responses
 - Configurable scan ranges and rate limiting for `scan_network`
 - Per-tool timeout and output-size caps
 - Port the low-level server to the `mcp` 2.x API (currently pinned to `mcp<2`)
+
+## Why this exists
+
+I wanted an agent that could actually diagnose a device on my LAN rather than
+tell me which commands to type — "why did the Raspberry Pi drop off the network"
+answered by `scan_network` → `ping_host` → `ssh_connect` → `ssh_execute`, with
+the SSH session held open across the whole investigation instead of re-dialling
+per command.
+
+Building it surfaced the more interesting problem. An MCP server is a set of
+capabilities handed to a non-deterministic caller, and the usual answer —
+document the risk and trust the operator — does not survive contact with that
+fact: the operator is not the one choosing when `rm -rf` runs. The design
+question is which capabilities are safe to expose *by default*, and what an
+opt-in has to look like so the model cannot grant it to itself. That is why the
+switch lives in the server's environment rather than in a tool argument, why the
+check sits at each function's own entry point rather than at the dispatch layer,
+and why the tests assert the refusal rather than the execution.
+
+The [Security model](#security-model) section is also honest about where the
+boundary stops: once enabled, `execute_local_command` is still arbitrary
+execution. A guardrail worth having is one whose limits you can state precisely.
 
 ## License
 
