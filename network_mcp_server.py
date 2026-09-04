@@ -1,23 +1,58 @@
 import asyncio
+import contextlib
+import json
+import os
+import platform
+import shutil
 import socket
 import subprocess
-import platform
-import os
-import psutil
-import shutil
-from typing import Any, Optional
-from mcp.server import Server
-from mcp.types import Tool, TextContent
-from mcp.server.stdio import stdio_server
-import json
-import paramiko
-from io import StringIO
 from pathlib import Path
+
+import paramiko
+import psutil
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import TextContent, Tool
 
 app = Server("local-network-server")
 
 # SSH connection pool to reuse connections
 ssh_connections = {}
+
+# An LLM decides when these three tools run, so "the operator will be careful"
+# is not a control. They are opt-in through the server's environment, which is
+# set in the MCP client config and is not reachable from a tool argument — the
+# agent cannot turn its own guardrails off.
+DESTRUCTIVE_TOOLS: dict[str, str] = {
+    "execute_local_command": "LNMCP_ENABLE_EXEC",
+    "ssh_execute": "LNMCP_ENABLE_SSH_EXEC",
+    "kill_process": "LNMCP_ENABLE_KILL",
+}
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def is_tool_enabled(tool_name: str) -> bool:
+    """Whether a tool may run. Tools outside DESTRUCTIVE_TOOLS are always on."""
+    env_var = DESTRUCTIVE_TOOLS.get(tool_name)
+    if env_var is None:
+        return True
+    return os.environ.get(env_var, "").strip().lower() in _TRUTHY
+
+
+def denied(tool_name: str) -> dict:
+    """The refusal payload, which names the variable that would allow the call."""
+    env_var = DESTRUCTIVE_TOOLS[tool_name]
+    return {
+        "success": False,
+        "policy": "default-deny",
+        "tool": tool_name,
+        "error": (
+            f"{tool_name} is disabled because it can change or destroy state. "
+            f"Set {env_var}=1 in the server's environment (the \"env\" block of "
+            f"your MCP client config) and restart the server to enable it."
+        ),
+    }
 
 def get_local_ip():
     """Get the local IP address of this machine"""
@@ -38,7 +73,7 @@ def get_network_prefix():
 async def scan_network(network_prefix: str, start: int = 1, end: int = 254):
     """Scan the local network for active hosts"""
     active_hosts = []
-    
+
     async def check_host(ip):
         try:
             # Try to connect to common ports
@@ -50,7 +85,7 @@ async def scan_network(network_prefix: str, start: int = 1, end: int = 254):
                 if result == 0:
                     try:
                         hostname = socket.gethostbyaddr(ip)[0]
-                    except:
+                    except OSError:
                         hostname = "Unknown"
                     active_hosts.append({
                         "ip": ip,
@@ -60,12 +95,12 @@ async def scan_network(network_prefix: str, start: int = 1, end: int = 254):
                     return
         except Exception:
             pass
-    
+
     tasks = []
     for i in range(start, end + 1):
         ip = f"{network_prefix}.{i}"
         tasks.append(check_host(ip))
-    
+
     await asyncio.gather(*tasks)
     return active_hosts
 
@@ -73,7 +108,7 @@ def ping_host(host: str) -> dict:
     """Ping a specific host to check if it's alive"""
     param = '-n' if platform.system().lower() == 'windows' else '-c'
     command = ['ping', param, '1', '-W', '1000' if platform.system().lower() == 'windows' else '-W1', host]
-    
+
     try:
         output = subprocess.run(command, capture_output=True, text=True, timeout=2)
         is_alive = output.returncode == 0
@@ -96,7 +131,7 @@ def check_port(host: str, port: int, timeout: float = 1.0) -> dict:
         sock.settimeout(timeout)
         result = sock.connect_ex((host, port))
         sock.close()
-        
+
         is_open = result == 0
         return {
             "host": host,
@@ -119,11 +154,11 @@ def scan_ports(host: str, ports: list[int]) -> list[dict]:
         results.append(check_port(host, port, timeout=0.5))
     return results
 
-def ssh_connect(host: str, username: str, password: Optional[str] = None, 
-                key_filename: Optional[str] = None, port: int = 22) -> dict:
+def ssh_connect(host: str, username: str, password: str | None = None,
+                key_filename: str | None = None, port: int = 22) -> dict:
     """Establish SSH connection to a host"""
     connection_key = f"{username}@{host}:{port}"
-    
+
     try:
         # Check if connection already exists and is active
         if connection_key in ssh_connections:
@@ -136,18 +171,16 @@ def ssh_connect(host: str, username: str, password: Optional[str] = None,
                     "message": f"Already connected to {connection_key}",
                     "connection_key": connection_key
                 }
-            except:
-                # Connection is dead, remove it
-                try:
+            except Exception:
+                # Connection is dead, drop it and reconnect below
+                with contextlib.suppress(Exception):
                     client.close()
-                except:
-                    pass
                 del ssh_connections[connection_key]
-        
+
         # Create new connection
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        
+
         # Connect with password or key
         if key_filename:
             client.connect(
@@ -170,16 +203,16 @@ def ssh_connect(host: str, username: str, password: Optional[str] = None,
                 "success": False,
                 "error": "Either password or key_filename must be provided"
             }
-        
+
         # Store connection
         ssh_connections[connection_key] = client
-        
+
         return {
             "success": True,
             "message": f"Successfully connected to {connection_key}",
             "connection_key": connection_key
         }
-    
+
     except paramiko.AuthenticationException:
         return {
             "success": False,
@@ -190,7 +223,7 @@ def ssh_connect(host: str, username: str, password: Optional[str] = None,
             "success": False,
             "error": f"SSH error: {str(e)}"
         }
-    except socket.error as e:
+    except OSError as e:
         return {
             "success": False,
             "error": f"Connection error: {str(e)}"
@@ -201,29 +234,32 @@ def ssh_connect(host: str, username: str, password: Optional[str] = None,
             "error": f"Unexpected error: {str(e)}"
         }
 
-def ssh_execute(host: str, username: str, command: str, 
-                password: Optional[str] = None, key_filename: Optional[str] = None,
+def ssh_execute(host: str, username: str, command: str,
+                password: str | None = None, key_filename: str | None = None,
                 port: int = 22, timeout: int = 30) -> dict:
     """Execute a command on a remote host via SSH"""
+    if not is_tool_enabled("ssh_execute"):
+        return denied("ssh_execute")
+
     connection_key = f"{username}@{host}:{port}"
-    
+
     try:
         # Try to get existing connection or create new one
         if connection_key not in ssh_connections:
             connect_result = ssh_connect(host, username, password, key_filename, port)
             if not connect_result["success"]:
                 return connect_result
-        
+
         client = ssh_connections[connection_key]
-        
+
         # Execute command
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-        
+
         # Get output
         exit_status = stdout.channel.recv_exit_status()
         stdout_text = stdout.read().decode('utf-8', errors='replace')
         stderr_text = stderr.read().decode('utf-8', errors='replace')
-        
+
         return {
             "success": True,
             "command": command,
@@ -232,7 +268,7 @@ def ssh_execute(host: str, username: str, command: str,
             "stderr": stderr_text,
             "connection_key": connection_key
         }
-    
+
     except Exception as e:
         return {
             "success": False,
@@ -243,7 +279,7 @@ def ssh_execute(host: str, username: str, command: str,
 def ssh_disconnect(host: str, username: str, port: int = 22) -> dict:
     """Close SSH connection to a host"""
     connection_key = f"{username}@{host}:{port}"
-    
+
     try:
         if connection_key in ssh_connections:
             client = ssh_connections[connection_key]
@@ -275,15 +311,18 @@ def ssh_list_connections() -> dict:
 # LOCAL SHELL COMMAND FUNCTIONS
 # ============================================
 
-def execute_local_command(command: str, shell: bool = True, timeout: int = 30, 
-                          cwd: Optional[str] = None, env: Optional[dict] = None) -> dict:
+def execute_local_command(command: str, shell: bool = True, timeout: int = 30,
+                          cwd: str | None = None, env: dict | None = None) -> dict:
     """Execute a command on the local machine"""
+    if not is_tool_enabled("execute_local_command"):
+        return denied("execute_local_command")
+
     try:
         # Merge environment variables if provided
         exec_env = os.environ.copy()
         if env:
             exec_env.update(env)
-        
+
         result = subprocess.run(
             command,
             shell=shell,
@@ -293,7 +332,7 @@ def execute_local_command(command: str, shell: bool = True, timeout: int = 30,
             cwd=cwd,
             env=exec_env
         )
-        
+
         return {
             "success": True,
             "command": command,
@@ -321,7 +360,7 @@ def get_system_info() -> dict:
         cpu_percent = psutil.cpu_percent(interval=1)
         memory = psutil.virtual_memory()
         disk = psutil.disk_usage('/')
-        
+
         return {
             "platform": {
                 "system": platform.system(),
@@ -359,7 +398,7 @@ def get_system_info() -> dict:
             "error": str(e)
         }
 
-def list_processes(filter_name: Optional[str] = None, limit: int = 50) -> dict:
+def list_processes(filter_name: str | None = None, limit: int = 50) -> dict:
     """List running processes"""
     try:
         processes = []
@@ -368,7 +407,7 @@ def list_processes(filter_name: Optional[str] = None, limit: int = 50) -> dict:
                 pinfo = proc.info
                 if filter_name and filter_name.lower() not in pinfo['name'].lower():
                     continue
-                    
+
                 processes.append({
                     "pid": pinfo['pid'],
                     "name": pinfo['name'],
@@ -379,10 +418,10 @@ def list_processes(filter_name: Optional[str] = None, limit: int = 50) -> dict:
                 })
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
-        
+
         # Sort by CPU usage
         processes.sort(key=lambda x: x['cpu_percent'], reverse=True)
-        
+
         return {
             "total_processes": len(processes),
             "processes": processes[:limit]
@@ -394,18 +433,21 @@ def list_processes(filter_name: Optional[str] = None, limit: int = 50) -> dict:
 
 def kill_process(pid: int, force: bool = False) -> dict:
     """Kill a process by PID"""
+    if not is_tool_enabled("kill_process"):
+        return denied("kill_process")
+
     try:
         process = psutil.Process(pid)
         process_name = process.name()
-        
+
         if force:
             process.kill()  # SIGKILL
         else:
             process.terminate()  # SIGTERM
-        
+
         # Wait for process to terminate
         process.wait(timeout=5)
-        
+
         return {
             "success": True,
             "pid": pid,
@@ -428,14 +470,14 @@ def kill_process(pid: int, force: bool = False) -> dict:
             "error": str(e)
         }
 
-def get_environment_variables(filter_key: Optional[str] = None) -> dict:
+def get_environment_variables(filter_key: str | None = None) -> dict:
     """Get environment variables"""
     try:
         env_vars = dict(os.environ)
-        
+
         if filter_key:
             env_vars = {k: v for k, v in env_vars.items() if filter_key.lower() in k.lower()}
-        
+
         return {
             "total_variables": len(env_vars),
             "variables": env_vars
@@ -445,31 +487,31 @@ def get_environment_variables(filter_key: Optional[str] = None) -> dict:
             "error": str(e)
         }
 
-def get_directory_listing(path: str = ".", recursive: bool = False, 
+def get_directory_listing(path: str = ".", recursive: bool = False,
                          show_hidden: bool = False, max_depth: int = 3) -> dict:
     """List directory contents"""
     try:
         path_obj = Path(path).resolve()
-        
+
         if not path_obj.exists():
             return {
                 "success": False,
                 "error": f"Path does not exist: {path}"
             }
-        
+
         if not path_obj.is_dir():
             return {
                 "success": False,
                 "error": f"Path is not a directory: {path}"
             }
-        
+
         items = []
-        
+
         if recursive:
             for item in path_obj.rglob('*'):
                 if not show_hidden and any(part.startswith('.') for part in item.parts):
                     continue
-                
+
                 # Check depth
                 try:
                     relative_depth = len(item.relative_to(path_obj).parts)
@@ -477,7 +519,7 @@ def get_directory_listing(path: str = ".", recursive: bool = False,
                         continue
                 except ValueError:
                     continue
-                
+
                 try:
                     stat = item.stat()
                     items.append({
@@ -493,7 +535,7 @@ def get_directory_listing(path: str = ".", recursive: bool = False,
             for item in path_obj.iterdir():
                 if not show_hidden and item.name.startswith('.'):
                     continue
-                
+
                 try:
                     stat = item.stat()
                     items.append({
@@ -505,7 +547,7 @@ def get_directory_listing(path: str = ".", recursive: bool = False,
                     })
                 except (PermissionError, OSError):
                     continue
-        
+
         return {
             "success": True,
             "path": str(path_obj),
@@ -522,7 +564,7 @@ def get_disk_usage(path: str = "/") -> dict:
     """Get disk usage information for a path"""
     try:
         usage = shutil.disk_usage(path)
-        
+
         return {
             "path": path,
             "total_bytes": usage.total,
@@ -538,36 +580,32 @@ def get_disk_usage(path: str = "/") -> dict:
             "error": str(e)
         }
 
-def find_files(path: str, pattern: str, recursive: bool = True, 
-               file_type: Optional[str] = None, max_results: int = 100) -> dict:
+def find_files(path: str, pattern: str, recursive: bool = True,
+               file_type: str | None = None, max_results: int = 100) -> dict:
     """Search for files matching a pattern"""
     try:
         path_obj = Path(path).resolve()
-        
+
         if not path_obj.exists():
             return {
                 "success": False,
                 "error": f"Path does not exist: {path}"
             }
-        
+
         results = []
-        
-        if recursive:
-            items = path_obj.rglob(pattern)
-        else:
-            items = path_obj.glob(pattern)
-        
+
+        items = path_obj.rglob(pattern) if recursive else path_obj.glob(pattern)
+
         for item in items:
             if len(results) >= max_results:
                 break
-            
+
             # Filter by file type if specified
-            if file_type:
-                if file_type == "file" and not item.is_file():
-                    continue
-                elif file_type == "directory" and not item.is_dir():
-                    continue
-            
+            if file_type == "file" and not item.is_file():
+                continue
+            if file_type == "directory" and not item.is_dir():
+                continue
+
             try:
                 stat = item.stat()
                 results.append({
@@ -579,7 +617,7 @@ def find_files(path: str, pattern: str, recursive: bool = True,
                 })
             except (PermissionError, OSError):
                 continue
-        
+
         return {
             "success": True,
             "search_path": str(path_obj),
@@ -593,21 +631,21 @@ def find_files(path: str, pattern: str, recursive: bool = True,
             "error": str(e)
         }
 
-def get_network_connections(filter_type: Optional[str] = None) -> dict:
+def get_network_connections(filter_type: str | None = None) -> dict:
     """Get active network connections"""
     try:
         connections = []
-        
+
         for conn in psutil.net_connections(kind='inet'):
             if filter_type and conn.type.name.lower() != filter_type.lower():
                 continue
-            
+
             try:
                 process = psutil.Process(conn.pid) if conn.pid else None
                 process_name = process.name() if process else "N/A"
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 process_name = "N/A"
-            
+
             connections.append({
                 "fd": conn.fd,
                 "family": conn.family.name,
@@ -618,7 +656,7 @@ def get_network_connections(filter_type: Optional[str] = None) -> dict:
                 "pid": conn.pid,
                 "process_name": process_name
             })
-        
+
         return {
             "total_connections": len(connections),
             "connections": connections
@@ -628,9 +666,21 @@ def get_network_connections(filter_type: Optional[str] = None) -> dict:
             "error": str(e)
         }
 
+def with_policy(tools: list[Tool]) -> list[Tool]:
+    """Mark disabled tools in the listing so the agent does not attempt them."""
+    marked = []
+    for tool in tools:
+        if tool.name in DESTRUCTIVE_TOOLS and not is_tool_enabled(tool.name):
+            note = f"[DISABLED - set {DESTRUCTIVE_TOOLS[tool.name]}=1 to enable] "
+            marked.append(tool.model_copy(update={"description": note + tool.description}))
+        else:
+            marked.append(tool)
+    return marked
+
+
 @app.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    return with_policy([
         # Network tools
         Tool(
             name="get_local_ip",
@@ -642,7 +692,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="scan_network",
-            description="Scan the local network to discover active devices. Returns IP addresses, hostnames, and open ports.",
+            description=(
+                "Scan the local network to discover active devices. "
+                "Returns IP addresses, hostnames, and open ports."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -717,7 +770,10 @@ async def list_tools() -> list[Tool]:
         # SSH tools
         Tool(
             name="ssh_connect",
-            description="Establish an SSH connection to a remote host. Connection is kept alive for subsequent commands.",
+            description=(
+                "Establish an SSH connection to a remote host. "
+                "Connection is kept alive for subsequent commands."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -997,7 +1053,7 @@ async def list_tools() -> list[Tool]:
                 }
             }
         )
-    ]
+    ])
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
@@ -1014,12 +1070,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         elif name == "scan_network":
             network_prefix = arguments.get("network_prefix") or get_network_prefix()
             start_ip = arguments.get("start_ip", 1)
             end_ip = arguments.get("end_ip", 254)
-            
+
             hosts = await scan_network(network_prefix, start_ip, end_ip)
             result = {
                 "network_scanned": f"{network_prefix}.{start_ip}-{end_ip}",
@@ -1030,7 +1086,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         elif name == "ping_host":
             host = arguments["host"]
             result = ping_host(host)
@@ -1038,7 +1094,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         elif name == "check_port":
             host = arguments["host"]
             port = arguments["port"]
@@ -1047,7 +1103,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         elif name == "scan_ports":
             host = arguments["host"]
             ports = arguments["ports"]
@@ -1056,7 +1112,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(results, indent=2)
             )]
-        
+
         elif name == "ssh_connect":
             result = ssh_connect(
                 host=arguments["host"],
@@ -1069,7 +1125,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         elif name == "ssh_execute":
             result = ssh_execute(
                 host=arguments["host"],
@@ -1084,7 +1140,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         elif name == "ssh_disconnect":
             result = ssh_disconnect(
                 host=arguments["host"],
@@ -1095,14 +1151,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         elif name == "ssh_list_connections":
             result = ssh_list_connections()
             return [TextContent(
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         # Local command tools
         elif name == "execute_local_command":
             result = execute_local_command(
@@ -1116,14 +1172,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         elif name == "get_system_info":
             result = get_system_info()
             return [TextContent(
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         elif name == "list_processes":
             result = list_processes(
                 filter_name=arguments.get("filter_name"),
@@ -1133,7 +1189,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         elif name == "kill_process":
             result = kill_process(
                 pid=arguments["pid"],
@@ -1143,7 +1199,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         elif name == "get_environment_variables":
             result = get_environment_variables(
                 filter_key=arguments.get("filter_key")
@@ -1152,7 +1208,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         elif name == "get_directory_listing":
             result = get_directory_listing(
                 path=arguments.get("path", "."),
@@ -1164,7 +1220,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         elif name == "get_disk_usage":
             result = get_disk_usage(
                 path=arguments.get("path", "/")
@@ -1173,7 +1229,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         elif name == "find_files":
             result = find_files(
                 path=arguments["path"],
@@ -1186,7 +1242,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         elif name == "get_network_connections":
             result = get_network_connections(
                 filter_type=arguments.get("filter_type")
@@ -1195,13 +1251,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 type="text",
                 text=json.dumps(result, indent=2)
             )]
-        
+
         else:
             return [TextContent(
                 type="text",
                 text=f"Unknown tool: {name}"
             )]
-    
+
     except Exception as e:
         return [TextContent(
             type="text",
@@ -1216,5 +1272,10 @@ async def main():
             app.create_initialization_options()
         )
 
-if __name__ == "__main__":
+def run() -> None:
+    """Console-script entry point (`local-network-mcp`)."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    run()
