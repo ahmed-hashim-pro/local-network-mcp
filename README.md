@@ -4,6 +4,8 @@
 
 A Model Context Protocol (MCP) server that allows Claude to interact with your local network, execute local shell commands, monitor system resources, and manage remote devices via SSH.
 
+The tools that change things (local shell commands, remote SSH commands and killing processes) are off until you opt in. See [Security model](#security-model).
+
 It turns "can you check why the Raspberry Pi dropped off the network" into a workflow the agent executes itself: `scan_network` → `ping_host` → `ssh_connect` → `ssh_execute` → diagnosis. Persistent SSH sessions mean the agent connects once and runs multi-step remote workflows (inspect logs, restart a service, verify) in a single conversation.
 
 ## Demo
