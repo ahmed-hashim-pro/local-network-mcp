@@ -17,12 +17,13 @@ of a live run.*
 ## Security model
 
 An LLM decides when these tools run, which makes "the operator will be careful"
-useless as a control. So the three tools that can change or destroy state are
+useless as a control. So the four tools that run commands or change state are
 **off unless you turn them on**:
 
 | Tool | Can do | Default | Opt in with |
 | --- | --- | --- | --- |
 | `execute_local_command` | run any local shell command | **denied** | `LNMCP_ENABLE_EXEC=1` |
+| `ssh_connect` | open an authenticated SSH session | **denied** | `LNMCP_ENABLE_SSH_EXEC=1` |
 | `ssh_execute` | run any command on a remote host | **denied** | `LNMCP_ENABLE_SSH_EXEC=1` |
 | `kill_process` | terminate a process by PID | **denied** | `LNMCP_ENABLE_KILL=1` |
 
@@ -39,7 +40,7 @@ the call:
   "success": false,
   "policy": "default-deny",
   "tool": "execute_local_command",
-  "error": "execute_local_command is disabled because it can change or destroy state. Set LNMCP_ENABLE_EXEC=1 in the server's environment (the \"env\" block of your MCP client config) and restart the server to enable it."
+  "error": "execute_local_command is disabled by default because it can run commands or change state. Set LNMCP_ENABLE_EXEC=1 in the server's environment (the \"env\" block of your MCP client config) and restart the server to enable it."
 }
 ```
 
@@ -51,8 +52,9 @@ Two properties make this a boundary rather than a suggestion:
   `env={"LNMCP_ENABLE_EXEC": "1"}` enables nothing. The agent cannot turn its own
   guardrails off, and there is a test for exactly that.
 - **The gate sits at each tool's own entry point**, not at the dispatch layer, so
-  an internal caller cannot route around it — `ssh_execute` stays refused even
-  though it is reachable via `ssh_connect`.
+  an internal caller cannot route around it. `ssh_execute` opens its session by
+  calling `ssh_connect`, and both check the gate, so no SSH session is opened
+  while `LNMCP_ENABLE_SSH_EXEC` is unset.
 
 ### What this does not do
 
@@ -74,7 +76,7 @@ flowchart LR
     C[Claude] <-->|MCP / JSON-RPC over stdio| S[network_mcp_server.py]
     S --> G{policy gate}
     G -->|read-only, always on| RO["scan_network, ping_host, check_port<br/>get_system_info, list_processes<br/>find_files, get_directory_listing"]
-    G -->|state-changing, opt-in| RW["execute_local_command<br/>ssh_execute, kill_process"]
+    G -->|state-changing, opt-in| RW["execute_local_command<br/>ssh_connect, ssh_execute<br/>kill_process"]
     RW -. denied unless LNMCP_ENABLE_* .-> C
     RO --> N[(local network / this host)]
     RW --> N
@@ -133,7 +135,7 @@ server, which waits on stdin for an MCP client and will look like it has hung:
 
 ```bash
 python -c "import network_mcp_server as s; print({t: s.is_tool_enabled(t) for t in s.DESTRUCTIVE_TOOLS})"
-# {'execute_local_command': False, 'ssh_execute': False, 'kill_process': False}
+# {'execute_local_command': False, 'ssh_connect': False, 'ssh_execute': False, 'kill_process': False}
 ```
 
 Run the tests (no credentials, no network, no reachable hosts required):

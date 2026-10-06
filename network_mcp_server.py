@@ -19,12 +19,15 @@ app = Server("local-network-server")
 # SSH connection pool to reuse connections
 ssh_connections = {}
 
-# An LLM decides when these three tools run, so "the operator will be careful"
+# An LLM decides when these tools run, so "the operator will be careful"
 # is not a control. They are opt-in through the server's environment, which is
 # set in the MCP client config and is not reachable from a tool argument — the
 # agent cannot turn its own guardrails off.
+# ssh_connect shares the SSH gate: it authenticates to another machine with
+# agent-supplied credentials, and a session is only useful for running commands.
 DESTRUCTIVE_TOOLS: dict[str, str] = {
     "execute_local_command": "LNMCP_ENABLE_EXEC",
+    "ssh_connect": "LNMCP_ENABLE_SSH_EXEC",
     "ssh_execute": "LNMCP_ENABLE_SSH_EXEC",
     "kill_process": "LNMCP_ENABLE_KILL",
 }
@@ -32,12 +35,16 @@ DESTRUCTIVE_TOOLS: dict[str, str] = {
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
+def env_flag(env_var: str) -> bool:
+    return os.environ.get(env_var, "").strip().lower() in _TRUTHY
+
+
 def is_tool_enabled(tool_name: str) -> bool:
     """Whether a tool may run. Tools outside DESTRUCTIVE_TOOLS are always on."""
     env_var = DESTRUCTIVE_TOOLS.get(tool_name)
     if env_var is None:
         return True
-    return os.environ.get(env_var, "").strip().lower() in _TRUTHY
+    return env_flag(env_var)
 
 
 def denied(tool_name: str) -> dict:
@@ -48,7 +55,7 @@ def denied(tool_name: str) -> dict:
         "policy": "default-deny",
         "tool": tool_name,
         "error": (
-            f"{tool_name} is disabled because it can change or destroy state. "
+            f"{tool_name} is disabled by default because it can run commands or change state. "
             f"Set {env_var}=1 in the server's environment (the \"env\" block of "
             f"your MCP client config) and restart the server to enable it."
         ),
@@ -157,6 +164,9 @@ def scan_ports(host: str, ports: list[int]) -> list[dict]:
 def ssh_connect(host: str, username: str, password: str | None = None,
                 key_filename: str | None = None, port: int = 22) -> dict:
     """Establish SSH connection to a host"""
+    if not is_tool_enabled("ssh_connect"):
+        return denied("ssh_connect")
+
     connection_key = f"{username}@{host}:{port}"
 
     try:

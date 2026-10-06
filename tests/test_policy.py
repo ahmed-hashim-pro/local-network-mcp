@@ -1,4 +1,4 @@
-"""The default-deny policy on the three state-changing tools.
+"""The default-deny policy on the opt-in tools.
 
 These tests assert the *policy*, never that an arbitrary shell string runs.
 The distinction matters: the value of this server is that an agent cannot
@@ -19,6 +19,7 @@ DESTRUCTIVE = sorted(server.DESTRUCTIVE_TOOLS)
 # harmless: if a gate ever regressed, the test would fail rather than do damage.
 CALLS = {
     "execute_local_command": lambda: server.execute_local_command("echo hello"),
+    "ssh_connect": lambda: server.ssh_connect("192.0.2.1", "nobody", password="x"),
     "ssh_execute": lambda: server.ssh_execute("192.0.2.1", "nobody", "echo hello"),
     "kill_process": lambda: server.kill_process(999_999_999),
 }
@@ -57,7 +58,16 @@ class TestDefaultDeny:
         assert server.is_tool_enabled(tool) is False
 
     @pytest.mark.parametrize(
-        "tool", ["ping_host", "scan_network", "get_system_info", "list_processes", "find_files"]
+        "tool",
+        [
+            "ping_host",
+            "scan_network",
+            "get_system_info",
+            "list_processes",
+            "find_files",
+            "ssh_disconnect",
+            "ssh_list_connections",
+        ],
     )
     def test_read_only_tools_are_never_gated(self, tool):
         assert server.is_tool_enabled(tool) is True
@@ -94,6 +104,22 @@ class TestTheGateIsReal:
         monkeypatch.setattr(server.paramiko, "SSHClient", explode)
         result = server.ssh_execute("192.0.2.1", "nobody", "echo hello")
         assert result["policy"] == "default-deny"
+
+    def test_denied_ssh_connect_never_builds_a_client(self, monkeypatch):
+        def explode(*args, **kwargs):
+            raise AssertionError("an SSH client was built despite a refusal")
+
+        monkeypatch.setattr(server.paramiko, "SSHClient", explode)
+        result = server.ssh_connect("192.0.2.1", "nobody", password="x")
+        assert result["policy"] == "default-deny"
+        assert server.ssh_connections == {}
+
+    def test_ssh_connect_and_ssh_execute_share_one_opt_in(self, monkeypatch):
+        """Two switches for one capability would let them drift apart."""
+        assert server.DESTRUCTIVE_TOOLS["ssh_connect"] == server.DESTRUCTIVE_TOOLS["ssh_execute"]
+        monkeypatch.setenv("LNMCP_ENABLE_SSH_EXEC", "1")
+        assert server.is_tool_enabled("ssh_connect") is True
+        assert server.is_tool_enabled("ssh_execute") is True
 
     def test_gate_reads_the_environment_at_call_time(self, monkeypatch):
         """Import order must not decide policy — a stale snapshot would be a real bug."""
