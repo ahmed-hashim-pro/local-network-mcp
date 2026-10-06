@@ -15,7 +15,8 @@ Installed. Point your MCP client at:
   command: $(pwd)/.venv/bin/python
   args:    ["$(pwd)/network_mcp_server.py"]
 
-The three state-changing tools (execute_local_command, ssh_execute,
-kill_process) are denied by default. See the Security model section of
-README.md to opt in to the ones you want.
+The opt-in tools (execute_local_command, ssh_connect, ssh_execute,
+kill_process) are denied by default, and SSH refuses hosts that are not in
+known_hosts. See the Security model section of README.md to opt in to the
+ones you want.
 EOF
