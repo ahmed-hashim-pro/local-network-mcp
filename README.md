@@ -4,7 +4,7 @@
 
 A Model Context Protocol (MCP) server that allows Claude to interact with your local network, execute local shell commands, monitor system resources, and manage remote devices via SSH.
 
-The tools that change things (local shell commands, remote SSH commands and killing processes) are off until you opt in. See [Security model](#security-model).
+The tools that run commands or change things (local shell commands, SSH sessions and remote commands, killing processes) are off until you opt in. See [Security model](#security-model).
 
 It turns "can you check why the Raspberry Pi dropped off the network" into a workflow the agent executes itself: `scan_network` → `ping_host` → `ssh_connect` → `ssh_execute` → diagnosis. Persistent SSH sessions mean the agent connects once and runs multi-step remote workflows (inspect logs, restart a service, verify) in a single conversation.
 
@@ -29,9 +29,20 @@ useless as a control. So the four tools that run commands or change state are
 | `ssh_execute` | run any command on a remote host | **denied** | `LNMCP_ENABLE_SSH_EXEC=1` |
 | `kill_process` | terminate a process by PID | **denied** | `LNMCP_ENABLE_KILL=1` |
 
-Everything else — discovery, ping, port checks, system stats, process *listing*,
-directory *listing*, file search — is read-only and always available. Out of the
-box this server is a diagnostic instrument that cannot change anything.
+Everything else (discovery, ping, port checks, system stats, process *listing*,
+directory *listing*, file search, environment variables) is always available.
+None of it runs a command, writes a file or stops a process, but always
+available is not the same as harmless:
+
+- `scan_network`, `scan_ports`, `check_port` and `ping_host` send traffic to
+  other machines, which can trip intrusion detection.
+- `get_environment_variables`, `get_directory_listing` and `find_files` read
+  whatever the server's user can read, including secrets kept in environment
+  variables.
+- `ssh_disconnect` closes a pooled SSH session.
+
+Out of the box the agent can inspect this machine and probe the network, but
+cannot run commands, open SSH sessions or stop processes.
 
 Disabled tools are also advertised as disabled in the tool listing, so the agent
 knows not to spend a turn on them. A refusal names the variable that would allow
@@ -176,9 +187,9 @@ Add this server to your Claude Desktop configuration:
 }
 ```
 
-That configuration is read-only: the agent can discover and diagnose, but not
-change anything. To enable a state-changing tool, add it to an `env` block — and
-add only the ones you actually want:
+With that configuration the agent can inspect and probe but cannot run
+commands, open SSH sessions or stop processes. To enable an opt-in tool, add its
+variable to an `env` block, and add only the ones you actually want:
 
 ```json
 {
@@ -207,8 +218,9 @@ After adding the configuration, restart Claude Desktop.
 
 ## Usage Examples
 
-> The first three groups below use tools that are **denied by default**.
-> See [Security model](#security-model) for the opt-in.
+> Local Command Execution, the kill examples under Process Management and all
+> of SSH Operations use tools that are **denied by default**. See
+> [Security model](#security-model) for the opt-ins.
 
 ### Local Command Execution
 - "Execute 'ls -la' on my local machine"
@@ -428,10 +440,13 @@ turn trust on first use off; delete the file (or the line) to forget them.
 
 ## SSH Connection Management
 
-The server maintains persistent SSH connections for better performance:
+The server keeps SSH connections in a pool keyed by `user@host:port`:
 - Connections are reused across multiple command executions
 - No need to reconnect for each command
-- Automatic connection recovery if a connection drops
+- `ssh_connect` checks a pooled connection (it runs `echo test` on the host)
+  and reconnects if it has dropped. `ssh_execute` does not: if its pooled
+  connection has dropped, the call fails, and calling `ssh_connect` again with
+  the credentials restores it
 - Manual disconnect when done
 
 ## Operational notes
@@ -586,7 +601,11 @@ These are the operational caveats that sit alongside it:
 
 ## Performance Notes
 
-- Network scanning can take 30-60 seconds for full range (254 IPs)
+- Network scanning is sequential: addresses are probed one at a time. An
+  address with nothing listening on any of the five probed ports (80, 443, 22,
+  445, 8080) costs up to 2.5 s (0.5 s timeout per port), so a full range of 254
+  mostly empty addresses can take around ten minutes. Narrow it with
+  `start_ip` and `end_ip`
 - Process listing is fast but may return many results
 - File search with recursive option can be slow on large directories
 - SSH connections are persistent and reused for better performance
@@ -598,9 +617,9 @@ These are the operational caveats that sit alongside it:
   current all-or-nothing opt-in
 - An audit log of every tool call, so an enabled server is reviewable
 - Structured JSON tool outputs alongside the current text responses
-- Configurable scan ranges and rate limiting for `scan_network`
+- Concurrent probing and rate limiting for `scan_network`
 - Per-tool timeout and output-size caps
-- Port the low-level server to the `mcp` 2.x API (currently pinned to `mcp<2`)
+- Port the low-level server to the `mcp` 2.x API (currently pinned to `mcp==1.29.1`)
 
 ## Why this exists
 
