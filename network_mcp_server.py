@@ -61,6 +61,82 @@ def denied(tool_name: str) -> dict:
         ),
     }
 
+SSH_TOFU_ENV = "LNMCP_SSH_TRUST_ON_FIRST_USE"
+SSH_KNOWN_HOSTS_ENV = "LNMCP_SSH_KNOWN_HOSTS"
+SYSTEM_KNOWN_HOSTS = Path("/etc/ssh/ssh_known_hosts")
+
+
+def server_known_hosts_path() -> Path:
+    """Where trust-on-first-use records keys. Never the user's own known_hosts."""
+    override = os.environ.get(SSH_KNOWN_HOSTS_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    config_home = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(config_home) / "local-network-mcp" / "known_hosts"
+
+
+def known_hosts_files() -> list[Path]:
+    # paramiko keeps the first key it reads per host and key type, so the
+    # user's file goes first and wins over anything this server recorded.
+    return [Path.home() / ".ssh" / "known_hosts", SYSTEM_KNOWN_HOSTS, server_known_hosts_path()]
+
+
+def _host_for_keygen(hostname: str) -> str:
+    return f'"{hostname}"' if hostname.startswith("[") else hostname
+
+
+class UnknownHostKeyPolicy(paramiko.MissingHostKeyPolicy):
+    """Paramiko calls this only for a host with no key in any known_hosts file.
+
+    A known host presenting a different key never gets here: paramiko raises
+    BadHostKeyException first, whatever the trust-on-first-use setting.
+    """
+
+    def __init__(self, trust_on_first_use: bool, store: Path):
+        self.trust_on_first_use = trust_on_first_use
+        self.store = store
+
+    def missing_host_key(self, client, hostname, key):
+        if not self.trust_on_first_use:
+            raise paramiko.SSHException(
+                f"Host key for {hostname} is not in any known_hosts file "
+                f"({', '.join(str(p) for p in known_hosts_files())}), so the server cannot verify it "
+                f"and refused to connect. Presented key: {key.get_name()} {key.fingerprint}. "
+                f"Check that fingerprint with the host's owner or console, then add the key to "
+                f"~/.ssh/known_hosts (for example by connecting once with ssh). To have this server "
+                f"record unknown keys on first contact instead, set {SSH_TOFU_ENV}=1 in its environment "
+                f"and restart it."
+            )
+        self.store.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(self.store, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(paramiko.hostkeys.HostKeyEntry([hostname], key).to_line())
+
+
+def new_ssh_client() -> paramiko.SSHClient:
+    client = paramiko.SSHClient()
+    for path in known_hosts_files():
+        if path.is_file():
+            client.load_system_host_keys(str(path))
+    client.set_missing_host_key_policy(
+        UnknownHostKeyPolicy(env_flag(SSH_TOFU_ENV), server_known_hosts_path())
+    )
+    return client
+
+
+def bad_host_key_error(hostname: str, port: int, error: paramiko.BadHostKeyException) -> str:
+    name = hostname if port == 22 else f"[{hostname}]:{port}"
+    return (
+        f"Host key for {name} does not match the one in known_hosts. Refusing to connect: "
+        f"this is what a man-in-the-middle looks like. Expected {error.expected_key.get_name()} "
+        f"{error.expected_key.fingerprint}, got {error.key.get_name()} {error.key.fingerprint}. "
+        f"If the host was legitimately reinstalled or rekeyed, confirm the new fingerprint, then "
+        f"remove the old entry with `ssh-keygen -R {_host_for_keygen(name)}` (add "
+        f"`-f {server_known_hosts_path()}` if this server recorded it). "
+        f"{SSH_TOFU_ENV} does not override this."
+    )
+
+
 def get_local_ip():
     """Get the local IP address of this machine"""
     try:
@@ -187,32 +263,33 @@ def ssh_connect(host: str, username: str, password: str | None = None,
                     client.close()
                 del ssh_connections[connection_key]
 
-        # Create new connection
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        # Connect with password or key
-        if key_filename:
-            client.connect(
-                hostname=host,
-                port=port,
-                username=username,
-                key_filename=key_filename,
-                timeout=10
-            )
-        elif password:
-            client.connect(
-                hostname=host,
-                port=port,
-                username=username,
-                password=password,
-                timeout=10
-            )
-        else:
+        if not key_filename and not password:
             return {
                 "success": False,
                 "error": "Either password or key_filename must be provided"
             }
+
+        client = new_ssh_client()
+        try:
+            if key_filename:
+                client.connect(
+                    hostname=host,
+                    port=port,
+                    username=username,
+                    key_filename=key_filename,
+                    timeout=10
+                )
+            else:
+                client.connect(
+                    hostname=host,
+                    port=port,
+                    username=username,
+                    password=password,
+                    timeout=10
+                )
+        except Exception:
+            client.close()
+            raise
 
         # Store connection
         ssh_connections[connection_key] = client
@@ -227,6 +304,11 @@ def ssh_connect(host: str, username: str, password: str | None = None,
         return {
             "success": False,
             "error": "Authentication failed. Check username/password or key."
+        }
+    except paramiko.BadHostKeyException as e:
+        return {
+            "success": False,
+            "error": bad_host_key_error(host, port, e)
         }
     except paramiko.SSHException as e:
         return {

@@ -63,8 +63,9 @@ The limits matter more than the feature list:
 - Once enabled, `execute_local_command` runs **arbitrary** shell commands with the
   permissions of the server process. There is no allowlist and no sandbox. The
   opt-in is a deliberate per-tool decision, nothing more.
-- SSH uses `AutoAddPolicy`, so an unknown host key is accepted on first contact.
-  Convenient on a LAN you own; wrong on a network you do not.
+- SSH host keys are checked against known_hosts (see
+  [SSH host keys](#ssh-host-keys)). An unknown host is refused unless you opt
+  into trust on first use, and then its first contact is unverified.
 - Tool calls are not audit-logged.
 
 Run it against machines you own.
@@ -384,6 +385,36 @@ The server supports two authentication methods:
 "Connect to 192.168.1.100 with username admin using key ~/.ssh/id_rsa"
 ```
 
+## SSH host keys
+
+`ssh_connect` (and `ssh_execute`, which connects through it) verifies the
+server's host key before sending any credentials. Keys are read from, in this
+order:
+
+1. `~/.ssh/known_hosts`
+2. `/etc/ssh/ssh_known_hosts`
+3. this server's own file, `~/.config/local-network-mcp/known_hosts`
+   (`$XDG_CONFIG_HOME/local-network-mcp/known_hosts` when that is set, or the
+   path in `LNMCP_SSH_KNOWN_HOSTS`)
+
+| Situation | Result |
+| --- | --- |
+| Host known, key matches | connects |
+| Host known, key differs (or is of another type) | **refused, always**. The error shows both fingerprints and the `ssh-keygen -R` command to remove a stale entry |
+| Host unknown | **refused by default**. The error shows the presented fingerprint |
+| Host unknown, `LNMCP_SSH_TRUST_ON_FIRST_USE=1` | connects and records the key in this server's own file |
+
+The simplest way to make a host known is to connect to it once with `ssh` and
+check the fingerprint it shows you. Hosts on a non-standard port are stored as
+`[host]:port`, the same as OpenSSH.
+
+Trust on first use writes only to the server's own file, never to your
+`~/.ssh/known_hosts`. An agent-driven first contact is unverified, and keeping
+it out of the file your `ssh`, `git` and other tools rely on means it cannot
+quietly become trusted elsewhere. It also keeps every key this server accepted
+in one place you can read or delete. Keys recorded there stay trusted after you
+turn trust on first use off; delete the file (or the line) to forget them.
+
 ## SSH Connection Management
 
 The server maintains persistent SSH connections for better performance:
@@ -404,8 +435,8 @@ These are the operational caveats that sit alongside it:
 - Prefer SSH keys over passwords. Credentials passed as tool arguments are held
   in memory for the life of the pooled connection and are never written to disk,
   but a key file that Paramiko reads is still the safer path.
-- `AutoAddPolicy` accepts unknown host keys on first contact, so first connection
-  on an untrusted network is trust-on-first-use with no verification.
+- Leave `LNMCP_SSH_TRUST_ON_FIRST_USE` unset on a network you do not control.
+  With it set, the first connection to a host accepts whatever key is presented.
 
 ## Common Local Commands
 
@@ -466,6 +497,10 @@ These are the operational caveats that sit alongside it:
 4. Check SSH server is running on target
 5. Ensure firewall allows SSH connections
 6. For key auth, check key file permissions (should be 600)
+7. "not in any known_hosts file": the host key is unknown. See
+   [SSH host keys](#ssh-host-keys)
+8. "does not match the one in known_hosts": the host key changed. Find out why
+   before removing the old entry
 
 ### Common Error Messages
 - **"Command not found"**: Command not in PATH or doesn't exist
@@ -551,7 +586,6 @@ These are the operational caveats that sit alongside it:
 - Command allowlist/denylist mode for `execute_local_command`, narrowing the
   current all-or-nothing opt-in
 - An audit log of every tool call, so an enabled server is reviewable
-- Strict host-key verification option to replace the `AutoAddPolicy` default
 - Structured JSON tool outputs alongside the current text responses
 - Configurable scan ranges and rate limiting for `scan_network`
 - Per-tool timeout and output-size caps
