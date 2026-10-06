@@ -23,6 +23,9 @@ ssh_connections = {}
 # is not a control. They are opt-in through the server's environment, which is
 # set in the MCP client config and is not reachable from a tool argument — the
 # agent cannot turn its own guardrails off.
+# The switches gate tools, not capabilities: an enabled shell can kill
+# processes and run ssh too, so LNMCP_ENABLE_EXEC implies the other two. That
+# is documented rather than blocklisted, since a blocklist is trivially evaded.
 # ssh_connect shares the SSH gate: it authenticates to another machine with
 # agent-supplied credentials, and a session is only useful for running commands.
 DESTRUCTIVE_TOOLS: dict[str, str] = {

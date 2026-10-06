@@ -63,6 +63,15 @@ The limits matter more than the feature list:
 - Once enabled, `execute_local_command` runs **arbitrary** shell commands with the
   permissions of the server process. There is no allowlist and no sandbox. The
   opt-in is a deliberate per-tool decision, nothing more.
+- **`LNMCP_ENABLE_EXEC` implies the other two switches.** They gate tools, not
+  capabilities. With the shell enabled the agent can run `kill`, `pkill` or
+  `ssh` itself, whatever `LNMCP_ENABLE_KILL` and `LNMCP_ENABLE_SSH_EXEC` say, and
+  an `ssh` run that way uses the system client's host-key settings, not this
+  server's. The server does not try to block those commands inside a shell
+  string: `/bin/kill`, `python -c`, a script file and many other spellings get
+  past any blocklist, and a blocklist would claim a boundary that is not there.
+  To let the agent stop processes without a shell, enable `LNMCP_ENABLE_KILL`
+  alone.
 - SSH host keys are checked against known_hosts (see
   [SSH host keys](#ssh-host-keys)). An unknown host is refused unless you opt
   into trust on first use, and then its first contact is unverified.

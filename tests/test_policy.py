@@ -179,5 +179,15 @@ class TestNoDrift:
         for tool in asyncio.run(server.list_tools()):
             assert f'"{tool.name}"' in dispatch, f"{tool.name} is advertised but never dispatched"
 
+    def test_every_setting_the_server_reads_is_documented(self):
+        """An opt-in the README does not name is one an operator cannot find."""
+        import inspect
+        import re
+        from pathlib import Path
+
+        readme = (Path(__file__).parent.parent / "README.md").read_text()
+        for env_var in set(re.findall(r"LNMCP_[A-Z_]+", inspect.getsource(server))):
+            assert env_var in readme, f"{env_var} is read by the server but not in the README"
+
     def test_entry_point_declared_in_pyproject_exists(self):
         assert callable(server.run)
